@@ -1,16 +1,29 @@
 import os
 import argparse
 from pathlib import Path
+from typing import Optional
 import pandas as pd
 import yfinance as yf
 from fredapi import Fred
 
 # Load FRED_API_KEY from config.txt if present (format: FRED_API_KEY=xxxxxxxx...)
 cfg = Path("config.txt")
-for line in cfg.read_text().splitlines():
-    if line.strip().startswith("FRED_API_KEY="):
-        os.environ["FRED_API_KEY"] = line.strip().split("=", 1)[1]
-        break
+if cfg.exists():
+    for line in cfg.read_text().splitlines():
+        if line.strip().startswith("FRED_API_KEY="):
+            os.environ["FRED_API_KEY"] = line.strip().split("=", 1)[1]
+            break
+
+FRED_SERIES = [
+    {"series_id": "DGS10", "column": "dgs10", "filename": "fred_10y.csv"},
+    {"series_id": "T10Y2Y", "column": "t10y2y", "filename": "t10y2y.csv"},
+    {"series_id": "FEDFUNDS", "column": "fedfunds", "filename": "fedfunds.csv"},
+    {"series_id": "CPIAUCSL", "column": "cpiaucsl", "filename": "cpiaucsl.csv"},
+    {"series_id": "DCOILWTICO", "column": "dcoilwtico", "filename": "dcoilwtico.csv"},
+    {"series_id": "BAA10YM", "column": "baa10ym", "filename": "baa10ym.csv"},
+    {"series_id": "INDPRO", "column": "indpro", "filename": "indpro.csv"},
+    {"series_id": "UNRATE", "column": "unrate", "filename": "unrate.csv"},
+]
 
 def ensure_dirs():
     Path("data/raw").mkdir(parents=True, exist_ok=True)
@@ -49,21 +62,39 @@ def fetch_sp500() -> pd.DataFrame:
     out = price.rename("sp500_close").to_frame()
     out.columns.name = None
     out.index = pd.to_datetime(out.index)
-    out.to_csv("data/raw/sp500.csv", index_label="date")
-    print(f"[S&P 500] -> data/raw/sp500.csv ({len(out)} rows)")
+    sp_path = Path("data/raw") / "sp500.csv"
+    out.to_csv(sp_path, index_label="date")
+    print(f"[S&P 500] -> {sp_path} ({len(out)} rows)")
     return out
 
-def fetch_fred_10y(start: str, end: str) -> pd.DataFrame:
+
+def _init_fred() -> Fred:
     key = os.getenv("FRED_API_KEY")
     if not key:
         raise RuntimeError("FRED_API_KEY missing. Put it in config.txt or export it.")
-    fred = Fred(api_key=key)
-    print("[FRED] DGS10 ...")
-    s = fred.get_series("DGS10", observation_start=start, observation_end=end)
-    df = s.to_frame("dgs10")
+    return Fred(api_key=key)
+
+
+def fetch_fred_series(
+    fred: Fred,
+    series_id: str,
+    column: str,
+    start: Optional[str],
+    end: Optional[str],
+    filename: str,
+) -> pd.DataFrame:
+    print(f"[FRED] {series_id} -> {filename} ...")
+    kwargs = {}
+    if start:
+        kwargs["observation_start"] = start
+    if end:
+        kwargs["observation_end"] = end
+    s = fred.get_series(series_id, **kwargs)
+    df = s.to_frame(column.lower())
     df.index = pd.to_datetime(df.index)
-    df.to_csv("data/raw/fred_10y.csv", index_label="date")
-    print(f"[FRED] -> data/raw/fred_10y.csv ({len(df)} rows)")
+    out_path = Path("data/raw") / filename
+    df.to_csv(out_path, index_label="date")
+    print(f"[FRED] -> {out_path} ({len(df)} rows)")
     return df
 
 def load_sentiment_kaggle(csv_path: str) -> pd.DataFrame:
@@ -126,7 +157,18 @@ def main():
     # Use the S&P span for FRED request bounds
     start_iso = sp.index.min().date().isoformat()
     end_iso = sp.index.max().date().isoformat()
-    fr = fetch_fred_10y(start_iso, end_iso)
+    fred = _init_fred()
+    fred_results = {}
+    for meta in FRED_SERIES:
+        fred_results[meta["column"]] = fetch_fred_series(
+            fred=fred,
+            series_id=meta["series_id"],
+            column=meta["column"],
+            start=start_iso,
+            end=end_iso,
+            filename=meta["filename"],
+        )
+    fr = fred_results["dgs10"]
 
     sent = None
     if args.sentiment == "kaggle":
