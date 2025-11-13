@@ -1,1 +1,4 @@
-timesfm/
+data/raw/
+data/predictions/
+*.png
+*.pth
