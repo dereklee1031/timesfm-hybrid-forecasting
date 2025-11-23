@@ -56,12 +56,26 @@ def run_window(series: pd.Series, context_len: int, horizon: int, stride: int):
     return preds, trues, dates, rmse, mae
 
 
+def compute_directional_accuracy(series_true: np.ndarray, series_pred: np.ndarray) -> float:
+    """Directional accuracy based on consecutive changes in the series."""
+    if len(series_true) < 2 or len(series_pred) < 2:
+        return float("nan")
+    true_diff = np.diff(series_true)
+    pred_diff = np.diff(series_pred)
+    min_len = min(len(true_diff), len(pred_diff))
+    if min_len == 0:
+        return float("nan")
+    true_sign = np.sign(true_diff[:min_len])
+    pred_sign = np.sign(pred_diff[:min_len])
+    return float(np.mean(true_sign == pred_sign))
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate naive rolling baseline for price series.")
     parser.add_argument("--data-path", type=str, default="data/raw/sp500.csv")
     parser.add_argument("--value-col", type=str, default="sp500_close")
-    parser.add_argument("--context", type=int, default=100)
-    parser.add_argument("--horizon", type=int, default=365)  # ~2 months of trading days
+    parser.add_argument("--context", type=int, default=16)
+    parser.add_argument("--horizon", type=int, default=14)  # ~2 weeks of trading days
     parser.add_argument("--stride", type=int, default=7)
     parser.add_argument("--output", type=str, default="results/baseline_persistence.csv")
     parser.add_argument(
@@ -131,8 +145,6 @@ def evaluate_and_save(
     label: str,
 ):
     preds, trues, dates, rmse, mae = run_window(series, context, horizon, stride)
-    print(f"[{label}] RMSE={rmse:.4f}  MAE={mae:.4f}  ({len(preds)} predictions)")
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
     results_df = pd.DataFrame(
         {
@@ -149,6 +161,9 @@ def evaluate_and_save(
         .agg({"y_true": "last", "y_pred": "mean"})
         .sort_values("date")
     )
+    dir_acc = compute_directional_accuracy(plot_df["y_true"].to_numpy(), plot_df["y_pred"].to_numpy())
+    dir_str = f"{dir_acc:.4f}" if np.isfinite(dir_acc) else "nan"
+    print(f"[{label}] RMSE={rmse:.4f}  MAE={mae:.4f}  DirAcc={dir_str}  ({len(preds)} predictions)")
     plt.figure(figsize=(10, 4))
     plt.plot(plot_df["date"], plot_df["y_true"], label="True")
     plt.plot(plot_df["date"], plot_df["y_pred"], label="Baseline", linestyle="--")

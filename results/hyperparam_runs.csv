@@ -1,0 +1,2 @@
+run_name,context_len,horizon_weeks,step_weeks,epochs,dropout,lr,scenario_k,rmse,r2,directional_accuracy
+default,20,2,1,150,0.3,0.0001,5,0.02748262695968151,-0.41638708114624023,0.5292153589315526

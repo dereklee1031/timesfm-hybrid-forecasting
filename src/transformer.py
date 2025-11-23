@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from matplotlib.ticker import MaxNLocator
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
@@ -190,31 +191,56 @@ class CNNStem(nn.Module):
         return self.norm(h)
 
 
-class MLPHead(nn.Module):
-    def __init__(self, input_dim: int, dropout: float):
+class TransformerHead(nn.Module):
+    def __init__(self, d_model: int, num_layers: int, dropout: float, nhead: int = 4):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, 64),
-            nn.GELU(),
-            nn.Linear(64, 1),
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
         )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
+
+
+class MLPHead(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: List[int], dropout: float):
+        super().__init__()
+        layers: List[nn.Module] = []
+        in_dim = input_dim
+        for hidden in hidden_dims:
+            layers.append(nn.Linear(in_dim, hidden))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(dropout))
+            in_dim = hidden
+        layers.append(nn.Linear(in_dim, 1))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         pooled = x[:, -1, :]
         return self.net(pooled)
 
 
-class CNNForecastNet(nn.Module):
-    def __init__(self, feature_dim: int, dropout: float):
+class ForecastModel(nn.Module):
+    def __init__(
+        self,
+        feature_dim: int,
+        dropout: float,
+        hidden_dims: List[int],
+        transformer_layers: int,
+    ):
         super().__init__()
         self.stem = CNNStem(feature_dim, dropout)
-        self.head = MLPHead(64, dropout)
+        self.transformer_head = TransformerHead(d_model=64, num_layers=transformer_layers, dropout=dropout)
+        self.head = MLPHead(64, hidden_dims, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.stem(x)
+        h = self.transformer_head(h)
         return self.head(h)
 
 
@@ -242,9 +268,10 @@ def train_cnn_model(
     patience: int,
     lr: float,
     use_huber: bool = False,
+    weight_decay: float = 1e-4,
 ):
     criterion = nn.SmoothL1Loss(beta=0.005) if use_huber else nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     best_state = None
     best_val = np.inf
     patience_ctr = 0
@@ -304,11 +331,19 @@ def train_cnn_model(
         model.load_state_dict(best_state)
 
 
-def fine_tune_cnn(model: nn.Module, seq: np.ndarray, targets: np.ndarray, lr: float, epochs: int, residual_std: np.ndarray):
+def fine_tune_cnn(
+    model: nn.Module,
+    seq: np.ndarray,
+    targets: np.ndarray,
+    lr: float,
+    epochs: int,
+    residual_std: np.ndarray,
+    weight_decay: float = 1e-4,
+):
     if len(seq) == 0:
         return
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     fine_ds = TensorDataset(
         torch.tensor(add_scenario_noise(seq, residual_std), dtype=torch.float32),
         torch.tensor(targets, dtype=torch.float32).unsqueeze(-1),
@@ -397,16 +432,19 @@ def plot_reconstructed_levels(results_df: pd.DataFrame, price_df: pd.DataFrame, 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Weekly leakage-free training with baselines + CNN transformer.")
-    parser.add_argument("--context-len", type=int, default=50)
+    parser.add_argument("--context-len", type=int, default=20)
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--fine-tune-epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--horizon-weeks", type=int, default=48)
+    parser.add_argument("--horizon-weeks", type=int, default=2)
     parser.add_argument("--step-weeks", type=int, default=1)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--scenario-k", type=int, default=SCENARIO_SAMPLES)
+    parser.add_argument("--cnn-hidden", nargs="+", type=int, default=[128, 64], help="Hidden layer sizes for the MLP head.")
+    parser.add_argument("--tfm-layers", type=int, default=1, help="Number of transformer layers after the CNN stem.")
+    parser.add_argument("--run-name", type=str, default="default")
     return parser.parse_args()
 
 
@@ -450,7 +488,12 @@ def walkforward_pipeline(args):
     train_seq, train_targets = build_sequence_arrays(true_scaled, y, args.context_len, args.context_len, train_end)
     val_seq, val_targets = build_sequence_arrays(true_scaled, y, args.context_len, train_end, split_idx)
 
-    model = CNNForecastNet(feature_dim=true_scaled.shape[1], dropout=args.dropout)
+    model = ForecastModel(
+        feature_dim=true_scaled.shape[1],
+        dropout=args.dropout,
+        hidden_dims=args.cnn_hidden,
+        transformer_layers=args.tfm_layers,
+    )
     initial_norm = sum(p.detach().norm().item() for p in model.parameters())
     train_cnn_model(
         model,
@@ -472,7 +515,7 @@ def walkforward_pipeline(args):
     drift = (base_pred_mean - base_feature_mean).abs()
     print(f"[Drift] mean absolute drift (train true vs future pred): {drift.mean():.4e}")
 
-    lin_model, xgb_model = None, None
+    lin_model, xgb_model, rf_model = None, None, None
     lagged_X, lagged_y = build_lagged_features(true_scaled, y, args.context_len, train_end)
     if len(lagged_X):
         lin_model = LinearRegression().fit(lagged_X, lagged_y)
@@ -492,6 +535,14 @@ def walkforward_pipeline(args):
                 xgb_model.fit(lagged_X, lagged_y, **fit_kwargs)
         else:
             print("[XGBoost] Not installed; skipping.")
+        rf_model = RandomForestRegressor(
+            n_estimators=500,
+            max_depth=6,
+            min_samples_leaf=5,
+            random_state=42,
+            n_jobs=-1,
+        )
+        rf_model.fit(lagged_X, lagged_y)
     else:
         print("[Baselines] Not enough samples for lagged regression.")
 
@@ -542,6 +593,7 @@ def walkforward_pipeline(args):
 
         lin_pred = None
         xgb_pred = None
+        rf_pred = None
         if lin_model is not None:
             lin_pred = baseline_predict_sequence(
                 lin_model,
@@ -563,6 +615,21 @@ def walkforward_pipeline(args):
                 hist_returns.append(pred_mean[len(baseline_rows) - 1])
             if baseline_rows:
                 xgb_pred = xgb_model.predict(np.array(baseline_rows))
+
+        if rf_model is not None:
+            baseline_rows = []
+            hist_returns = list(y[:cursor])
+            hist_features = list(true_scaled[:cursor])
+            for feat in future_features_flat:
+                feat_lags = hist_features[-4:]
+                ret_lags = hist_returns[-4:]
+                if len(feat_lags) < 4 or len(ret_lags) < 4:
+                    continue
+                baseline_rows.append(np.concatenate(feat_lags[::-1] + [np.array(ret_lags[::-1])]))
+                hist_features.append(feat)
+                hist_returns.append(pred_mean[len(baseline_rows) - 1])
+            if baseline_rows:
+                rf_pred = rf_model.predict(np.array(baseline_rows))
 
         rmse = np.sqrt(mean_squared_error(y_future, pred_mean))
         r2 = r2_score(y_future, pred_mean)
@@ -595,6 +662,7 @@ def walkforward_pipeline(args):
                     "y_pred_p90": pred_p90,
                     "y_pred_lin": lin_pred if lin_pred is not None else np.nan,
                     "y_pred_xgb": xgb_pred if xgb_pred is not None else np.nan,
+                    "y_pred_rf": rf_pred if rf_pred is not None else np.nan,
                 }
             )
         )
@@ -633,6 +701,33 @@ def walkforward_pipeline(args):
     plot_predictions(results_df, args.horizon_weeks)
     plot_residuals(results_df, args.horizon_weeks)
     plot_reconstructed_levels(results_df, df[["date", "sp500_close"]].copy(), args.horizon_weeks)
+
+    overall_rmse = float(np.sqrt(mean_squared_error(results_df["y_true"], results_df["y_pred_mean"])))
+    overall_r2 = float(r2_score(results_df["y_true"], results_df["y_pred_mean"]))
+    overall_dir = compute_directional_accuracy(results_df["y_true"].values, results_df["y_pred_mean"].values)
+    log_row = pd.DataFrame(
+        [
+            {
+                "run_name": args.run_name,
+                "context_len": args.context_len,
+                "horizon_weeks": args.horizon_weeks,
+                "step_weeks": args.step_weeks,
+                "epochs": args.epochs,
+                "dropout": args.dropout,
+                "lr": args.lr,
+                "scenario_k": args.scenario_k,
+                "cnn_hidden": "-".join(map(str, args.cnn_hidden)),
+                "tfm_layers": args.tfm_layers,
+                "rmse": overall_rmse,
+                "r2": overall_r2,
+                "directional_accuracy": overall_dir,
+            }
+        ]
+    )
+    log_path = RESULTS_DIR / "hyperparam_runs.csv"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_row.to_csv(log_path, mode="a", header=not log_path.exists(), index=False)
+    print(f"[Hyperparam Log] {args.run_name} -> RMSE={overall_rmse:.4f} R^2={overall_r2:.4f} DirAcc={overall_dir:.3f}")
 
     if results_df["y_pred_mean"].std() < 1e-6:
         print("[Warning] Predictions collapsed; consider --dropout 0.3 and --lr 3e-4 with Huber loss.")
