@@ -18,11 +18,6 @@ from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
-try:
-    from xgboost import XGBRegressor
-except Exception:  # pragma: no cover - optional dependency
-    XGBRegressor = None
-
 
 BASES = ["dgs10", "baa10ym", "cpiaucsl", "dcoilwtico", "fedfunds", "indpro", "t10y2y", "unrate"]
 MONTHLY_BASES = {"baa10ym", "cpiaucsl", "fedfunds", "indpro", "unrate"}
@@ -432,18 +427,18 @@ def plot_reconstructed_levels(results_df: pd.DataFrame, price_df: pd.DataFrame, 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Weekly leakage-free training with baselines + CNN transformer.")
-    parser.add_argument("--context-len", type=int, default=20)
-    parser.add_argument("--epochs", type=int, default=150)
+    parser.add_argument("--context-len", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--patience", type=int, default=15)
-    parser.add_argument("--fine-tune-epochs", type=int, default=20)
+    parser.add_argument("--fine-tune-epochs", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--horizon-weeks", type=int, default=2)
     parser.add_argument("--step-weeks", type=int, default=1)
-    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--scenario-k", type=int, default=SCENARIO_SAMPLES)
-    parser.add_argument("--cnn-hidden", nargs="+", type=int, default=[128, 64], help="Hidden layer sizes for the MLP head.")
-    parser.add_argument("--tfm-layers", type=int, default=1, help="Number of transformer layers after the CNN stem.")
+    parser.add_argument("--cnn-hidden", nargs="+", type=int, default=[256, 128], help="Hidden layer sizes for the MLP head.")
+    parser.add_argument("--tfm-layers", type=int, default=2, help="Number of transformer layers after the CNN stem.")
     parser.add_argument("--run-name", type=str, default="default")
     return parser.parse_args()
 
@@ -515,26 +510,10 @@ def walkforward_pipeline(args):
     drift = (base_pred_mean - base_feature_mean).abs()
     print(f"[Drift] mean absolute drift (train true vs future pred): {drift.mean():.4e}")
 
-    lin_model, xgb_model, rf_model = None, None, None
+    lin_model, rf_model = None, None
     lagged_X, lagged_y = build_lagged_features(true_scaled, y, args.context_len, train_end)
     if len(lagged_X):
         lin_model = LinearRegression().fit(lagged_X, lagged_y)
-        if XGBRegressor is not None:
-            xgb_model = XGBRegressor(
-                n_estimators=500,
-                learning_rate=0.05,
-                max_depth=3,
-                subsample=0.9,
-                colsample_bytree=0.9,
-                objective="reg:squarederror",
-            )
-            fit_kwargs = {"eval_set": [(lagged_X, lagged_y)], "verbose": False}
-            try:
-                xgb_model.fit(lagged_X, lagged_y, early_stopping_rounds=25, **fit_kwargs)
-            except TypeError:
-                xgb_model.fit(lagged_X, lagged_y, **fit_kwargs)
-        else:
-            print("[XGBoost] Not installed; skipping.")
         rf_model = RandomForestRegressor(
             n_estimators=500,
             max_depth=6,
@@ -592,7 +571,6 @@ def walkforward_pipeline(args):
         pred_p90 = np.percentile(preds_samples, 90, axis=0)
 
         lin_pred = None
-        xgb_pred = None
         rf_pred = None
         if lin_model is not None:
             lin_pred = baseline_predict_sequence(
@@ -601,21 +579,6 @@ def walkforward_pipeline(args):
                 y[:cursor],
                 future_features_flat,
             )
-        if xgb_model is not None:
-            baseline_rows = []
-            hist_returns = list(y[:cursor])
-            hist_features = list(true_scaled[:cursor])
-            for feat in future_features_flat:
-                feat_lags = hist_features[-4:]
-                ret_lags = hist_returns[-4:]
-                if len(feat_lags) < 4 or len(ret_lags) < 4:
-                    continue
-                baseline_rows.append(np.concatenate(feat_lags[::-1] + [np.array(ret_lags[::-1])]))
-                hist_features.append(feat)
-                hist_returns.append(pred_mean[len(baseline_rows) - 1])
-            if baseline_rows:
-                xgb_pred = xgb_model.predict(np.array(baseline_rows))
-
         if rf_model is not None:
             baseline_rows = []
             hist_returns = list(y[:cursor])
@@ -661,7 +624,6 @@ def walkforward_pipeline(args):
                     "y_pred_p50": pred_p50,
                     "y_pred_p90": pred_p90,
                     "y_pred_lin": lin_pred if lin_pred is not None else np.nan,
-                    "y_pred_xgb": xgb_pred if xgb_pred is not None else np.nan,
                     "y_pred_rf": rf_pred if rf_pred is not None else np.nan,
                 }
             )

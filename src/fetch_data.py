@@ -6,7 +6,7 @@ import pandas as pd
 import yfinance as yf
 from fredapi import Fred
 
-# Load FRED_API_KEY from config.txt if present (format: FRED_API_KEY=xxxxxxxx...)
+# Load FRED_API_KEY from config.txt 
 cfg = Path("config.txt")
 if cfg.exists():
     for line in cfg.read_text().splitlines():
@@ -97,19 +97,7 @@ def fetch_fred_series(
     print(f"[FRED] -> {out_path} ({len(df)} rows)")
     return df
 
-def load_sentiment_kaggle(csv_path: str) -> pd.DataFrame:
-    """Expect CSV with columns: date, sentiment_compound (already computed)."""
-    print(f"[Sentiment] Kaggle simple: {csv_path}")
-    df = pd.read_csv(csv_path)
-    if "date" not in df.columns or "sentiment_compound" not in df.columns:
-        raise ValueError("Sentiment CSV must have 'date' and 'sentiment_compound' columns.")
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.set_index("date").sort_index()
-    df.to_csv("data/raw/sentiment.csv", index_label="date")
-    print(f"[Sentiment] -> data/raw/sentiment.csv ({len(df)} rows)")
-    return df
-
-def merge_and_save(sp500: pd.DataFrame, dgs10: pd.DataFrame, sentiment: pd.DataFrame | None) -> pd.DataFrame:
+def merge_and_save(sp500: pd.DataFrame, dgs10: pd.DataFrame) -> pd.DataFrame:
     print("[Merge] business-day align + returns ...")
     start = max(sp500.index.min(), dgs10.index.min())
     end = min(sp500.index.max(), dgs10.index.max())
@@ -119,7 +107,7 @@ def merge_and_save(sp500: pd.DataFrame, dgs10: pd.DataFrame, sentiment: pd.DataF
     s = sp500.reindex(idx).rename_axis("date")
     f = dgs10.reindex(idx).rename_axis("date").ffill(limit=5)
 
-    # 🔒 Force canonical S&P column name
+    # Force canonical S&P column name
     if "sp500_close" not in s.columns:
         for c in ["sp500_close", "Adj Close", "Adj_Close", "Close", "close"]:
             if c in s.columns:
@@ -128,14 +116,7 @@ def merge_and_save(sp500: pd.DataFrame, dgs10: pd.DataFrame, sentiment: pd.DataF
     if "sp500_close" not in s.columns:
         raise KeyError(f"Couldn't find S&P close column in {list(s.columns)}")
 
-    frames = [s, f]
-    if sentiment is not None:
-        sent = sentiment.reindex(idx).rename_axis("date").ffill(limit=2)
-        if "sentiment_compound" not in sent.columns and len(sent.columns) == 1:
-            sent = sent.rename(columns={sent.columns[0]: "sentiment_compound"})
-        frames.append(sent)
-
-    m = pd.concat(frames, axis=1)
+    m = pd.concat([s, f], axis=1)
 
     # Returns from the guaranteed column
     m["sp500_ret_1d"] = m["sp500_close"].pct_change()
@@ -147,10 +128,7 @@ def merge_and_save(sp500: pd.DataFrame, dgs10: pd.DataFrame, sentiment: pd.DataF
     return m
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--sentiment", choices=["none", "kaggle"], default="none")
-    ap.add_argument("--kaggle-path", type=str, help="CSV with date,sentiment_compound")
-    args = ap.parse_args()
+    argparse.ArgumentParser().parse_args()
 
     ensure_dirs()
     sp = fetch_sp500()
@@ -169,14 +147,7 @@ def main():
             filename=meta["filename"],
         )
     fr = fred_results["dgs10"]
-
-    sent = None
-    if args.sentiment == "kaggle":
-        if not args.kaggle_path:
-            raise ValueError("--kaggle-path required when --sentiment kaggle")
-        sent = load_sentiment_kaggle(args.kaggle_path)
-
-    merge_and_save(sp, fr, sent)
+    merge_and_save(sp, fr)
 
 if __name__ == "__main__":
     main()

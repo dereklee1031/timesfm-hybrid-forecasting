@@ -1,6 +1,7 @@
 # -------------------------------------------------------------
-# TimesFM Historical-Only Forecasting — MLP Version
-# Identical structure to hybrid MLP but NO predicted macro inputs.
+# TimesFM Hybrid Forecasting — MLP Version
+# Matches partner's Transformer pipeline structure,
+# but uses a simpler flattened-sequence MLP.
 # -------------------------------------------------------------
 
 import argparse
@@ -38,7 +39,7 @@ PUBLICATION_LAGS_DAYS = {
 }
 
 WEEKLY_FREQ = "W-FRI"
-RESULTS_DIR = Path("results_mlp_hist")
+RESULTS_DIR = Path("results_mlp_simple")
 NEAR_ZERO_STD = 1e-12
 SCENARIO_SAMPLES = 5
 
@@ -76,30 +77,42 @@ def merge_all_series():
     frames = [load_base_series(b) for b in BASES]
     sp = pd.read_csv("data/raw/sp500.csv", parse_dates=["date"]).sort_values("date")
     sp_weekly = compute_5day_log_return(sp)
-    dfs = frames + [sp_weekly]
 
+    dfs = frames + [sp_weekly]
     merged = reduce(lambda left, right:
                     pd.merge(left, right, on="date", how="outer"), dfs)
+
     merged = merged.sort_values("date").ffill().dropna().reset_index(drop=True)
 
-    # KEEP ONLY TRUE FEATURES — remove predicted ones entirely
-    keep = [c for c in merged.columns if (c.endswith("_true") or c in ["date", "sp500_close", "y_ret"])]
-    merged = merged[keep].dropna().reset_index(drop=True)
-    return merged
+    # Add log-transformed oil features
+    merged["oil_log_true"] = np.log1p(merged["dcoilwtico_true"])
+    merged["oil_log_pred"] = np.log1p(merged["dcoilwtico_pred"])
 
-def drop_near_constant_columns(train_df):
-    mask = train_df.std(axis=0) >= NEAR_ZERO_STD
-    return [col for col, keep in zip(train_df.columns, mask) if keep]
+    return merged.dropna().reset_index(drop=True)
+
+def align_true_pred_columns(df):
+    true_cols = sorted([c for c in df.columns if c.endswith("_true")])
+    pred_cols = sorted([c for c in df.columns if c.endswith("_pred")])
+
+    true_bases = [c.replace("_true", "") for c in true_cols]
+    pred_bases = [c.replace("_pred", "") for c in pred_cols]
+    if true_bases != pred_bases:
+        raise ValueError(f"Mismatch true vs pred columns: {true_cols} vs {pred_cols}")
+    return true_cols, pred_cols
+
+def drop_near_constant_columns(train_true_df):
+    mask = train_true_df.std(axis=0) >= NEAR_ZERO_STD
+    return [col for col, keep in zip(train_true_df.columns, mask) if keep]
 
 # -------------------------------------------------------------
-# SEQUENCES & MLP (unchanged)
+# SEQUENCE & NOISE BUILDING
 # -------------------------------------------------------------
 
 def build_sequence_arrays(features, targets, seq_len, start_idx, end_idx):
     seqs, labs = [], []
     begin = max(seq_len, start_idx)
     for idx in range(begin, end_idx):
-        seq = features[idx - seq_len:idx]
+        seq = features[idx - seq_len: idx]   # shape (seq_len, feature_dim)
         seqs.append(seq)
         labs.append(targets[idx])
     if not seqs:
@@ -107,19 +120,36 @@ def build_sequence_arrays(features, targets, seq_len, start_idx, end_idx):
     return np.array(seqs, dtype=np.float32), np.array(labs, dtype=np.float32)
 
 def add_scenario_noise(sequences, residual_std):
+    """
+    sequences:  (batch, seq_len, features)
+    residual_std: (features,)
+    returns noisy sequences of same shape
+    """
     noise = np.random.normal(
-        scale=residual_std.reshape(1,1,-1),
+        scale=residual_std.reshape(1, 1, -1),
         size=sequences.shape
     )
     return sequences + noise.astype(np.float32)
 
+# -------------------------------------------------------------
+# SEQUENCE MLP (flattened)
+# -------------------------------------------------------------
+
 class SequenceMLP(nn.Module):
+    """
+    Accepts input shaped (batch, seq_len, feature_dim),
+    flattens to (batch, seq_len * feature_dim),
+    then passes through MLP layers.
+    """
     def __init__(self, seq_len, feature_dim, hidden_sizes, dropout):
         super().__init__()
+        self.seq_len = seq_len
+        self.feature_dim = feature_dim
+
         layers = []
         input_dim = seq_len * feature_dim
-        prev_dim = input_dim
 
+        prev_dim = input_dim
         for h in hidden_sizes:
             layers.append(nn.Linear(prev_dim, h))
             layers.append(nn.ReLU())
@@ -127,72 +157,94 @@ class SequenceMLP(nn.Module):
             prev_dim = h
 
         layers.append(nn.Linear(prev_dim, 1))
+
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)
+        # x: (batch, seq_len, feature_dim)
+        x = x.view(x.size(0), -1)  # flatten
         return self.net(x)
 
 # -------------------------------------------------------------
-# TRAINING (unchanged)
+# TRAINING AND FINE-TUNING
 # -------------------------------------------------------------
 
-def train_mlp(model, train_seq, train_targets, val_seq, val_targets,
-              residual_std, epochs, batch_size, patience, lr):
+def train_mlp(model, train_seq, train_targets,
+              val_seq, val_targets,
+              residual_std, epochs, batch_size,
+              patience, lr):
 
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
 
+    # Validation loader
     val_loader = None
     if len(val_seq) > 0:
-        val_loader = DataLoader(
-            TensorDataset(torch.tensor(val_seq), torch.tensor(val_targets).unsqueeze(-1)),
-            batch_size=batch_size
+        val_ds = TensorDataset(
+            torch.tensor(val_seq, dtype=torch.float32),
+            torch.tensor(val_targets, dtype=torch.float32).unsqueeze(-1)
         )
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
     best_val = float('inf')
     patience_ctr = 0
     best_state = None
 
-    for epoch in range(1, epochs+1):
-        noisy = add_scenario_noise(train_seq, residual_std)
-        train_loader = DataLoader(
-            TensorDataset(torch.tensor(noisy), torch.tensor(train_targets).unsqueeze(-1)),
-            batch_size=batch_size, shuffle=True
-        )
+    for epoch in range(1, epochs + 1):
 
+        # Add scenario noise to training data
+        noisy = add_scenario_noise(train_seq, residual_std)
+
+        train_ds = TensorDataset(
+            torch.tensor(noisy, dtype=torch.float32),
+            torch.tensor(train_targets, dtype=torch.float32).unsqueeze(-1)
+        )
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+
+        # Train loop
         model.train()
-        total_loss = 0; total = 0
+        running = 0.0
+        total = 0
         for xb, yb in train_loader:
             optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
+            preds = model(xb)
+            loss = criterion(preds, yb)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()*xb.size(0)
+            running += loss.item() * xb.size(0)
             total += xb.size(0)
+        train_loss = running / max(total, 1)
 
+        # Validation
         val_loss = None
-        if val_loader:
-            model.eval(); vtot=0; vloss=0
+        if val_loader is not None:
+            model.eval()
+            v_running = 0.0
+            v_total = 0
             with torch.no_grad():
                 for xb, yb in val_loader:
-                    loss = criterion(model(xb), yb)
-                    vloss += loss.item()*xb.size(0)
-                    vtot += xb.size(0)
-            val_loss = vloss / max(vtot,1)
+                    preds = model(xb)
+                    loss = criterion(preds, yb)
+                    v_running += loss.item() * xb.size(0)
+                    v_total += xb.size(0)
+            val_loss = v_running / max(v_total, 1)
 
-        print(f"[MLP] Epoch {epoch} Train={total_loss/max(total,1):.6f} Val={val_loss:.6f}")
+        print(f"[MLP] Epoch {epoch} | Train={train_loss:.6f} | Val={val_loss:.6f}")
 
-        if val_loss < best_val - 1e-5:
+        # Early stopping
+        if val_loss is not None and val_loss < best_val - 1e-5:
             best_val = val_loss
-            best_state = {k:v.clone() for k,v in model.state_dict().items()}
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
             patience_ctr = 0
         else:
             patience_ctr += 1
             if patience_ctr >= patience:
-                print("Early stopping"); break
+                print("Early stopping MLP.")
+                break
 
-    if best_state: model.load_state_dict(best_state)
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
     return best_val
 
 def fine_tune_mlp(model, seq, targets, lr, epochs, residual_std):
@@ -309,7 +361,7 @@ def plot_predictions(results_df, horizon):
     plt.title(f"Weekly 5-day Log Returns (MLP h={horizon})")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(RESULTS_DIR / f"mlp_simple_hist_predictions_h{horizon}.png", dpi=300)
+    plt.savefig(RESULTS_DIR / f"mlp_simple_predictions_h{horizon}.png", dpi=300)
     plt.close()
 
 def plot_residuals(results_df, horizon):
@@ -324,7 +376,7 @@ def plot_residuals(results_df, horizon):
     plt.title("Residuals & Rolling RMSE (MLP)")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(RESULTS_DIR / f"mlp_simple_hist_residuals_h{horizon}.png", dpi=300)
+    plt.savefig(RESULTS_DIR / f"mlp_simple_residuals_h{horizon}.png", dpi=300)
     plt.close()
 
 def plot_reconstructed_levels(results_df, price_df, horizon):
@@ -339,7 +391,7 @@ def plot_reconstructed_levels(results_df, price_df, horizon):
     merged["level_pred"] = base_price * np.exp(merged["y_pred_mean"].cumsum())
 
     merged.to_csv(
-        RESULTS_DIR / f"mlp_simple_hist_levels_h{horizon}.csv",
+        RESULTS_DIR / f"mlp_simple_levels_h{horizon}.csv",
         index=False
     )
 
@@ -351,52 +403,66 @@ def plot_reconstructed_levels(results_df, price_df, horizon):
     plt.ylabel("SP500 Level")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(RESULTS_DIR / f"mlp_simple_hist_levels_h{horizon}.png", dpi=300)
+    plt.savefig(RESULTS_DIR / f"mlp_simple_levels_h{horizon}.png", dpi=300)
     plt.close()
 
 # -------------------------------------------------------------
-# WALK-FORWARD PIPELINE — Historical Only Version
+# WALK-FORWARD PIPELINE
 # -------------------------------------------------------------
 
 def walkforward_pipeline(args):
 
     df = merge_all_series()
+    true_cols, pred_cols = align_true_pred_columns(df)
     df = df.sort_values("date").reset_index(drop=True)
 
     if "y_ret" not in df.columns:
-        raise ValueError("y_ret missing.")
+        raise ValueError("y_ret missing from merged dataframe.")
 
-    # y target
     y = df["y_ret"].values.astype(np.float32)
 
     # ---------------------------
-    # SPLIT
+    # SPLIT INTO TRAIN / VAL / TEST (walk-forward region)
     # ---------------------------
     split_idx = int(len(df) * 0.6)
     val_size = max(int(len(df) * 0.06), 8)
     train_end = split_idx - val_size
 
-    # True macro columns only
-    true_cols = [c for c in df.columns if c.endswith("_true")]
+    # Remove near-constant columns
+    train_true = df.iloc[:train_end][true_cols]
+    keep_cols = drop_near_constant_columns(train_true)
 
-    keep_cols = drop_near_constant_columns(df.iloc[:train_end][true_cols])
-    df = df[keep_cols + ["date", "sp500_close", "y_ret"]]
+    df = df[
+        keep_cols +
+        [c for c in pred_cols if c.replace("_pred", "_true") in keep_cols] +
+        ["date", "sp500_close", "y_ret"]
+    ]
+
+    true_cols, pred_cols = align_true_pred_columns(df)
 
     # ---------------------------
-    # SCALING — only TRUE history
+    # SCALING
     # ---------------------------
-    clean_cols = [c.replace("_true", "") for c in keep_cols]
-    true_df = df[keep_cols].copy()
-    true_df.columns = clean_cols
+    true_df = df[true_cols].copy()
+    pred_df = df[pred_cols].copy()
+
+    # Remove suffix for consistent scaler
+    true_df.columns = [c.replace("_true", "") for c in true_cols]
+    pred_df.columns = [c.replace("_pred", "") for c in pred_cols]
 
     scaler = StandardScaler().fit(true_df.iloc[:train_end])
-    true_scaled = scaler.transform(true_df)
 
-    # Noise from history only
-    residual_std = np.maximum(true_scaled[:train_end].std(axis=0), 1e-6)
+    true_scaled = scaler.transform(true_df)
+    pred_scaled = scaler.transform(pred_df)
+
+    # Residuals for scenario noise
+    residual_std = np.maximum(
+        (pred_scaled[:train_end] - true_scaled[:train_end]).std(axis=0),
+        1e-6
+    )
 
     # ---------------------------
-    # BUILD TRAIN / VAL sequences
+    # SEQUENCE BUILDING
     # ---------------------------
     seq_len = args.context_len
     feature_dim = true_scaled.shape[1]
@@ -405,7 +471,7 @@ def walkforward_pipeline(args):
     val_seq, val_targets = build_sequence_arrays(true_scaled, y, seq_len, train_end, split_idx)
 
     # ---------------------------
-    # SWEEP
+    # HYPERPARAMETER SWEEP
     # ---------------------------
     best_cfg = hyperparameter_sweep(
         seq_len, feature_dim,
@@ -418,7 +484,12 @@ def walkforward_pipeline(args):
     # ---------------------------
     # TRAIN FINAL MODEL
     # ---------------------------
-    model = SequenceMLP(seq_len, feature_dim, best_cfg["hidden_sizes"], best_cfg["dropout"])
+    model = SequenceMLP(
+        seq_len, feature_dim,
+        best_cfg["hidden_sizes"],
+        best_cfg["dropout"]
+    )
+
     train_mlp(
         model,
         train_seq, train_targets,
@@ -431,15 +502,17 @@ def walkforward_pipeline(args):
     )
 
     # ---------------------------
-    # WALK-FORWARD EVALUATION
+    # WALK-FORWARD ROLLING EVALUATION
     # ---------------------------
     rolling_preds = []
     rolling_metrics = []
+
     cursor = split_idx
     window_idx = 1
     fine_lr = best_cfg["lr"] * 0.3
 
     while cursor < len(df):
+
         future_end = min(cursor + args.horizon_weeks, len(df))
         if future_end <= cursor:
             break
@@ -449,28 +522,39 @@ def walkforward_pipeline(args):
         future_targets = []
 
         for idx in range(cursor, future_end):
-            if idx < seq_len: continue
+            if idx < seq_len: 
+                continue
 
-            # HISTORICAL ONLY — ALWAYS USE true_scaled
-            seq = true_scaled[idx - seq_len : idx]
+            # determine where to pull the context from
+            if idx < split_idx:
+        # all true history
+                seq = true_scaled[idx - seq_len : idx]
+            else:
+            # use predicted features only for future windows
+                seq = pred_scaled[idx - seq_len : idx]
 
             future_seq.append(seq)
             future_dates.append(df["date"].iloc[idx])
             future_targets.append(y[idx])
 
+        if not future_seq:
+            break
+
         future_seq = np.array(future_seq, dtype=np.float32)
         future_targets = np.array(future_targets, dtype=np.float32)
         future_dates = np.array(future_dates)
 
-        # SCENARIO SAMPLING (still allowed — uses historical noise)
+        # ---------------------------
+        # MONTE CARLO SCENARIOS
+        # ---------------------------
         preds_samples = []
         model.eval()
         with torch.no_grad():
             for _ in range(args.scenario_k):
                 scen = add_scenario_noise(future_seq, residual_std)
-                preds_samples.append(
-                    model(torch.tensor(scen)).squeeze(-1).numpy()
-                )
+                scen_tensor = torch.tensor(scen, dtype=torch.float32)
+                preds = model(scen_tensor).squeeze(-1).numpy()
+                preds_samples.append(preds)
 
         preds_samples = np.stack(preds_samples)
         pred_mean = preds_samples.mean(axis=0)
@@ -478,12 +562,17 @@ def walkforward_pipeline(args):
         pred_p50 = np.percentile(preds_samples, 50, axis=0)
         pred_p90 = np.percentile(preds_samples, 90, axis=0)
 
-        # METRICS
+        # ---------------------------
+        # EVALUATE WINDOW
+        # ---------------------------
         rmse = np.sqrt(mean_squared_error(future_targets, pred_mean))
         r2 = r2_score(future_targets, pred_mean)
         dir_acc = compute_directional_accuracy(future_targets, pred_mean)
 
-        print(f"[Hist Window {window_idx}] {future_dates[0]} → {future_dates[-1]}  RMSE={rmse:.4f}  R2={r2:.4f}  DirAcc={dir_acc:.3f}")
+        print(
+            f"[Window {window_idx}] {future_dates[0]} → {future_dates[-1]}  "
+            f"RMSE={rmse:.4f}  R2={r2:.4f}  DirAcc={dir_acc:.3f}"
+        )
 
         rolling_metrics.append(
             RollingWindowResult(
@@ -507,9 +596,17 @@ def walkforward_pipeline(args):
             })
         )
 
-        # FINE-TUNE ON TRUE HISTORY
+        # ---------------------------
+        # FINE TUNE
+        # ---------------------------
         fine_seq, fine_targets = build_sequence_arrays(true_scaled, y, seq_len, cursor, future_end)
-        fine_tune_mlp(model, fine_seq, fine_targets, fine_lr, args.fine_tune_epochs, residual_std)
+
+        fine_tune_mlp(
+            model,
+            fine_seq, fine_targets,
+            fine_lr, args.fine_tune_epochs,
+            residual_std
+        )
 
         cursor += args.step_weeks
         window_idx += 1
@@ -520,8 +617,11 @@ def walkforward_pipeline(args):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     results_df = pd.concat(rolling_preds, ignore_index=True).sort_values("date")
-    results_df.to_csv(RESULTS_DIR / "mlp_simple_hist_rolling_predictions.csv", index=False)
+    results_path = RESULTS_DIR / "mlp_simple_rolling_predictions.csv"
+    results_df.to_csv(results_path, index=False)
+    print(f"Saved predictions → {results_path}")
 
+    # Metrics CSV
     metrics_df = pd.DataFrame({
         "window": [m.window for m in rolling_metrics],
         "start_date": [m.start_date for m in rolling_metrics],
@@ -530,12 +630,24 @@ def walkforward_pipeline(args):
         "r2": [m.r2 for m in rolling_metrics],
         "directional_accuracy": [m.direction_acc for m in rolling_metrics],
     })
-    metrics_df.to_csv(RESULTS_DIR / "mlp_simple_hist_rolling_metrics.csv", index=False)
+    metrics_path = RESULTS_DIR / "mlp_simple_rolling_metrics.csv"
+    metrics_df.to_csv(metrics_path, index=False)
+    print(f"Saved metrics → {metrics_path}")
 
+    # ---------------------------
+    # PLOTS
+    # ---------------------------
     plot_predictions(results_df, args.horizon_weeks)
     plot_residuals(results_df, args.horizon_weeks)
-    plot_reconstructed_levels(results_df, df[["date", "sp500_close"]], args.horizon_weeks)
+    plot_reconstructed_levels(
+        results_df,
+        df[["date", "sp500_close"]].copy(),
+        args.horizon_weeks
+    )
 
+    # ---------------------------
+    # OVERALL METRICS
+    # ---------------------------
     overall_rmse = np.sqrt(mean_squared_error(results_df["y_true"], results_df["y_pred_mean"]))
     overall_r2 = r2_score(results_df["y_true"], results_df["y_pred_mean"])
     overall_dir = compute_directional_accuracy(results_df["y_true"], results_df["y_pred_mean"])
@@ -546,7 +658,7 @@ def walkforward_pipeline(args):
 # -------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="TimesFM MLP hist Forecaster")
+    parser = argparse.ArgumentParser(description="TimesFM MLP Forecaster")
 
     parser.add_argument("--context-len", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=20)
@@ -593,4 +705,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

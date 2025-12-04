@@ -1,7 +1,6 @@
 # -------------------------------------------------------------
 # TimesFM Hybrid Forecasting — MLP Version
-# Matches partner's Transformer pipeline structure,
-# but uses a simpler flattened-sequence MLP.
+# Uses predicted macro inputs + historical SP500 returns.
 # -------------------------------------------------------------
 
 import argparse
@@ -276,7 +275,7 @@ def fine_tune_mlp(model, seq, targets, lr, epochs, residual_std):
             optimizer.step()
 
 # -------------------------------------------------------------
-# HYPERPARAMETER SWEEP UTILITIES
+# HYPERPARAMETER SWEEP 
 # -------------------------------------------------------------
 
 def parse_hidden_grid(v):
@@ -659,19 +658,19 @@ def walkforward_pipeline(args):
     print(f"[Overall] RMSE={overall_rmse:.4f}  R^2={overall_r2:.4f}  DirAcc={overall_dir:.3f}")
 
 # -------------------------------------------------------------
-# CLI
+#hyperparameter parsing
 # -------------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(description="TimesFM MLP Forecaster")
 
-    parser.add_argument("--context-len", type=int, default=50)
-    parser.add_argument("--epochs", type=int, default=120)
-    parser.add_argument("--patience", type=int, default=12)
-    parser.add_argument("--fine-tune-epochs", type=int, default=15)
+    parser.add_argument("--context-len", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--fine-tune-epochs", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=32)
 
-    parser.add_argument("--horizon-weeks", type=int, default=48)
+    parser.add_argument("--horizon-weeks", type=int, default=2)
     parser.add_argument("--step-weeks", type=int, default=1)
     parser.add_argument("--scenario-k", type=int, default=SCENARIO_SAMPLES)
 
